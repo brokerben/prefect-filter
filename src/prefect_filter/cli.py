@@ -12,7 +12,8 @@ def main() -> None:
     pipeline_id = os.environ.get("PIPELINE_ID", "")
     if not pipeline_id:
         raise SystemExit("PIPELINE_ID environment variable is required")
-    asyncio.run(filter_pipeline(pipeline_id))
+    flow_status = os.environ.get("FLOW_STATUS") or None
+    asyncio.run(filter_pipeline(pipeline_id, flow_status=flow_status))
 
 
 def serve() -> None:

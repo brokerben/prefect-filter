@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import timedelta
 from typing import Any
 
 from prefect import flow, task
+from prefect.tasks import task_input_hash
 
 from prefect_filter import client
 from prefect_filter.config import settings
@@ -125,6 +127,11 @@ def _parse_filter_result(raw: str, company_id: str) -> FilterResult:
     )
 
 
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+
+
 @task(name="evaluate_company", task_run_name="evaluate_company {company_id}")
 async def evaluate_company_task(
     description: str, criteria: str, company_id: str
@@ -159,7 +166,11 @@ async def evaluate_company_task(
     return parsed
 
 
-@task(name="fetch_pipeline")
+@task(
+    name="fetch_pipeline",
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(minutes=5),
+)
 async def fetch_pipeline_task(pipeline_id: str) -> dict[str, Any]:
     data = await client.fetch_pipeline(pipeline_id)
     logger.info("fetch_pipeline.done", pipeline_id=pipeline_id)
@@ -171,6 +182,13 @@ async def fetch_companies_task(pipeline_id: str) -> list[dict[str, Any]]:
     companies = await client.fetch_companies(pipeline_id)
     logger.info("fetch_companies.done", pipeline_id=pipeline_id, count=len(companies))
     return companies
+
+
+@task(name="fetch_company", task_run_name="fetch_company {company_id}")
+async def fetch_company_task(company_id: str) -> dict[str, Any]:
+    data = await client.fetch_company(company_id)
+    logger.info("fetch_company.done", company_id=company_id)
+    return data
 
 
 @task(
@@ -222,10 +240,14 @@ async def update_flow_status_task(
     )
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
 async def _apply_filter_decision(
     result: FilterResult,
     pipeline_id: str,
-    update_pipeline: bool,
 ) -> None:
     company_id = result.company_id
 
@@ -236,155 +258,127 @@ async def _apply_filter_decision(
             reason="answer_no",
             confidence=result.confidence.value,
         )
-        if update_pipeline:
-            await update_status_task(pipeline_id, company_id, "excluded")
-            await update_flow_status_task(pipeline_id, company_id, "Z2")
+        await update_status_task(pipeline_id, company_id, "excluded")
+        await update_flow_status_task(pipeline_id, company_id, "Z2")
         return
 
-    # answer == YES
     if result.confidence == Confidence.LOW:
         logger.info(
             "filter_decision.excluded_low_confidence",
             company_id=company_id,
             confidence=result.confidence.value,
         )
-        if update_pipeline:
-            await update_flow_status_task(pipeline_id, company_id, "Z2")
-            await update_status_task(pipeline_id, company_id, "excluded")
+        await update_flow_status_task(pipeline_id, company_id, "Z2")
+        await update_status_task(pipeline_id, company_id, "excluded")
         return
 
-    # YES with Medium/High confidence -> active
     logger.info(
         "filter_decision.active",
         company_id=company_id,
         confidence=result.confidence.value,
     )
-    if update_pipeline:
-        await update_status_task(
-            pipeline_id, company_id, "active", clause=result.outreach_message
-        )
-        await update_flow_status_task(pipeline_id, company_id, "C3.1")
+    await update_status_task(
+        pipeline_id, company_id, "active", clause=result.outreach_message
+    )
+    await update_flow_status_task(pipeline_id, company_id, "C3.1")
 
 
-async def _process_company(
-    company: dict[str, Any],
-    search_criteria: str,
-    pipeline_id: str,
-    update_pipeline: bool,
-    semaphore: asyncio.Semaphore,
-) -> None:
-    company_id = str(company["id"])
-    websites = company.get("websites") or []
-
-    async with semaphore:
-        try:
-            if update_pipeline:
-                await update_status_task(pipeline_id, company_id, "processing")
-
-            if not websites:
-                logger.warning(
-                    "process_company.no_websites", company_id=company_id
-                )
-                if update_pipeline:
-                    await update_flow_status_task(pipeline_id, company_id, "X2")
-                return
-
-            website_id = websites[0].get("websiteId") or websites[0].get("id")
-            if not website_id:
-                logger.warning(
-                    "process_company.no_website_id", company_id=company_id
-                )
-                if update_pipeline:
-                    await update_flow_status_task(pipeline_id, company_id, "X2")
-                return
-
-            website_data = await fetch_website_task(str(website_id))
-            description = (
-                website_data.get("website", {}).get("description") or ""
-            )
-
-            if not description:
-                logger.info(
-                    "process_company.empty_description",
-                    company_id=company_id,
-                    website_id=str(website_id),
-                )
-                if update_pipeline:
-                    await update_flow_status_task(pipeline_id, company_id, "X2")
-                return
-
-            result = await evaluate_company_task(
-                description=description,
-                criteria=search_criteria,
-                company_id=company_id,
-            )
-            await _apply_filter_decision(result, pipeline_id, update_pipeline)
-
-        except Exception as e:
-            logger.error(
-                "process_company.failed",
-                company_id=company_id,
-                error=str(e),
-            )
-            if update_pipeline:
-                try:
-                    await update_flow_status_task(
-                        pipeline_id, company_id, "X2"
-                    )
-                except Exception:
-                    pass
+# ---------------------------------------------------------------------------
+# Flows
+# ---------------------------------------------------------------------------
 
 
-@flow(name="filter_pipeline", log_prints=True)
-async def filter_pipeline(pipeline_id: str) -> None:
-    """Filter all companies in a pipeline against its investment criteria.
+@flow(name="filter_single_company", log_prints=True)
+async def filter_single_company(
+    pipeline_id: str, company_id: str
+) -> FilterResult:
+    """Evaluate a single company against a pipeline's investment criteria.
 
-    Corresponds to the main n8n trigger paths: manual, webhook, and
-    execute-by-another-workflow.
+    Core processing unit: fetches criteria from the pipeline, evaluates the
+    company, and updates pipeline status/flow_status accordingly.
     """
     setup_logging()
 
     pipeline_data = await fetch_pipeline_task(pipeline_id)
     search_criteria = pipeline_data["pipeline"]["searchCriteria"]
 
-    companies = await fetch_companies_task(pipeline_id)
-    if not companies:
-        logger.info("filter_pipeline.no_companies", pipeline_id=pipeline_id)
-        return
+    try:
+        await update_status_task(pipeline_id, company_id, "processing")
 
-    logger.info(
-        "filter_pipeline.start",
-        pipeline_id=pipeline_id,
-        count=len(companies),
-    )
-    semaphore = asyncio.Semaphore(settings.max_concurrency)
+        company_data = await fetch_company_task(company_id)
+        company = company_data.get("company", {})
+        websites = company.get("websites") or []
 
-    results = await asyncio.gather(
-        *[
-            _process_company(
-                company=c,
-                search_criteria=search_criteria,
-                pipeline_id=pipeline_id,
-                update_pipeline=True,
-                semaphore=semaphore,
+        if not websites:
+            logger.warning(
+                "filter_single_company.no_websites", company_id=company_id
             )
-            for c in companies
-        ],
-        return_exceptions=True,
-    )
+            await update_flow_status_task(pipeline_id, company_id, "X2")
+            return FilterResult(
+                answer="YES",
+                confidence=Confidence.LOW,
+                company_id=company_id,
+                outreach_message="",
+                reasoning="No website found for company; defaulting to YES.",
+            )
 
-    failed = sum(1 for r in results if isinstance(r, BaseException))
-    if failed:
-        logger.warning(
-            "filter_pipeline.some_failed",
-            failed=failed,
-            total=len(companies),
+        website_id = websites[0].get("websiteId") or websites[0].get("id")
+        if not website_id:
+            logger.warning(
+                "filter_single_company.no_website_id", company_id=company_id
+            )
+            await update_flow_status_task(pipeline_id, company_id, "X2")
+            return FilterResult(
+                answer="YES",
+                confidence=Confidence.LOW,
+                company_id=company_id,
+                outreach_message="",
+                reasoning="No website ID found for company; defaulting to YES.",
+            )
+
+        website_data = await fetch_website_task(str(website_id))
+        description = website_data.get("website", {}).get("description") or ""
+
+        if not description:
+            logger.info(
+                "filter_single_company.empty_description",
+                company_id=company_id,
+                website_id=str(website_id),
+            )
+            await update_flow_status_task(pipeline_id, company_id, "X2")
+            return FilterResult(
+                answer="YES",
+                confidence=Confidence.LOW,
+                company_id=company_id,
+                outreach_message="",
+                reasoning="Website description is empty; defaulting to YES.",
+            )
+
+        result = await evaluate_company_task(
+            description=description,
+            criteria=search_criteria,
+            company_id=company_id,
         )
-    logger.info(
-        "filter_pipeline.done",
-        pipeline_id=pipeline_id,
-        processed=len(companies) - failed,
-    )
+        await _apply_filter_decision(result, pipeline_id)
+        return result
+
+    except Exception as e:
+        logger.error(
+            "filter_single_company.failed",
+            company_id=company_id,
+            error=str(e),
+        )
+        try:
+            await update_flow_status_task(pipeline_id, company_id, "X2")
+        except Exception:
+            pass
+        return FilterResult(
+            answer="YES",
+            confidence=Confidence.LOW,
+            company_id=company_id,
+            outreach_message="",
+            reasoning=f"Processing failed: {e}; defaulting to YES.",
+        )
 
 
 @flow(name="filter_companies", log_prints=True)
@@ -393,12 +387,10 @@ async def filter_companies(
 ) -> None:
     """Filter specific companies against a pipeline's investment criteria.
 
-    Corresponds to the n8n Webhook2 path (filter-companies-search-criteria).
+    Invokes filter_single_company as a subflow for each company, with
+    concurrency limited by settings.max_concurrency.
     """
     setup_logging()
-
-    pipeline_data = await fetch_pipeline_task(pipeline_id)
-    search_criteria = pipeline_data["pipeline"]["searchCriteria"]
 
     logger.info(
         "filter_companies.start",
@@ -407,94 +399,24 @@ async def filter_companies(
     )
     semaphore = asyncio.Semaphore(settings.max_concurrency)
 
-    async def _process_by_id(cid: str) -> None:
+    async def _run(cid: str) -> FilterResult | None:
         async with semaphore:
             try:
-                await client.update_company_status(
-                    pipeline_id, cid, "processing"
-                )
-            except Exception as e:
-                logger.warning(
-                    "filter_companies.status_update_failed",
-                    company_id=cid,
-                    error=str(e),
-                )
-
-            try:
-                company_data = await client.fetch_company(cid)
-                company = company_data.get("company", {})
-                company_with_fields = {
-                    "id": company.get("id", cid),
-                    "websites": company.get("websites", []),
-                }
+                return await filter_single_company(pipeline_id, cid)
             except Exception as e:
                 logger.error(
-                    "filter_companies.fetch_failed",
+                    "filter_companies.subflow_failed",
                     company_id=cid,
                     error=str(e),
                 )
-                try:
-                    await client.update_flow_status(pipeline_id, cid, "X2")
-                except Exception:
-                    pass
-                return
-
-            # Release semaphore via a new _process_company call
-            await _process_company_inner(
-                company_with_fields, search_criteria, pipeline_id
-            )
-
-    async def _process_company_inner(
-        company: dict, criteria: str, pid: str
-    ) -> None:
-        company_id = str(company["id"])
-        websites = company.get("websites") or []
-
-        if not websites:
-            logger.warning(
-                "filter_companies.no_websites", company_id=company_id
-            )
-            await client.update_flow_status(pid, company_id, "X2")
-            return
-
-        website_id = websites[0].get("websiteId") or websites[0].get("id")
-        if not website_id:
-            await client.update_flow_status(pid, company_id, "X2")
-            return
-
-        try:
-            website_data = await fetch_website_task(str(website_id))
-        except Exception as e:
-            logger.error(
-                "filter_companies.website_fetch_failed",
-                company_id=company_id,
-                error=str(e),
-            )
-            await client.update_flow_status(pid, company_id, "X2")
-            return
-
-        description = website_data.get("website", {}).get("description") or ""
-        if not description:
-            logger.info(
-                "filter_companies.empty_description",
-                company_id=company_id,
-            )
-            await client.update_flow_status(pid, company_id, "X2")
-            return
-
-        result = await evaluate_company_task(
-            description=description,
-            criteria=criteria,
-            company_id=company_id,
-        )
-        await _apply_filter_decision(result, pid, update_pipeline=True)
+                return None
 
     results = await asyncio.gather(
-        *[_process_by_id(cid) for cid in company_ids],
+        *[_run(cid) for cid in company_ids],
         return_exceptions=True,
     )
 
-    failed = sum(1 for r in results if isinstance(r, BaseException))
+    failed = sum(1 for r in results if isinstance(r, BaseException) or r is None)
     logger.info(
         "filter_companies.done",
         pipeline_id=pipeline_id,
@@ -502,48 +424,42 @@ async def filter_companies(
     )
 
 
-@flow(name="filter_single_company", log_prints=True)
-async def filter_single_company(
-    company_id: str, criteria: str
-) -> FilterResult:
-    """Evaluate a single company against provided criteria (no pipeline status updates).
+@flow(name="filter_pipeline", log_prints=True)
+async def filter_pipeline(
+    pipeline_id: str, flow_status: str | None = None
+) -> None:
+    """Filter all companies in a pipeline against its investment criteria.
 
-    Corresponds to the n8n Webhook1 path (company-filter).
+    Fetches companies, optionally filters by flowStatus, then delegates
+    to filter_companies as a subflow.
     """
     setup_logging()
 
-    company_data = await client.fetch_company(company_id)
-    company = company_data.get("company", {})
-    websites = company.get("websites") or []
+    companies = await fetch_companies_task(pipeline_id)
+    if not companies:
+        logger.info("filter_pipeline.no_companies", pipeline_id=pipeline_id)
+        return
 
-    if not websites:
-        logger.warning(
-            "filter_single_company.no_websites", company_id=company_id
+    if flow_status is not None:
+        companies = [c for c in companies if c.get("flowStatus") == flow_status]
+
+    company_ids = [str(c["id"]) for c in companies]
+
+    if not company_ids:
+        logger.info(
+            "filter_pipeline.no_matching_companies",
+            pipeline_id=pipeline_id,
+            flow_status=flow_status,
         )
-        return FilterResult(
-            answer="YES",
-            confidence=Confidence.LOW,
-            company_id=company_id,
-            outreach_message="",
-            reasoning="No website found for company; defaulting to YES.",
-        )
+        return
 
-    website_id = websites[0].get("websiteId") or websites[0].get("id")
-    website_data = await fetch_website_task(str(website_id))
-    description = website_data.get("website", {}).get("description") or ""
-
-    if not description:
-        return FilterResult(
-            answer="YES",
-            confidence=Confidence.LOW,
-            company_id=company_id,
-            outreach_message="",
-            reasoning="Website description is empty; defaulting to YES.",
-        )
-
-    result = await evaluate_company_task(
-        description=description,
-        criteria=criteria,
-        company_id=company_id,
+    logger.info(
+        "filter_pipeline.start",
+        pipeline_id=pipeline_id,
+        count=len(company_ids),
+        flow_status=flow_status,
     )
-    return result
+
+    await filter_companies(pipeline_id, company_ids)
+
+    logger.info("filter_pipeline.done", pipeline_id=pipeline_id)
