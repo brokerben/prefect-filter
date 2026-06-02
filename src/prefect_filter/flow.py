@@ -313,6 +313,7 @@ async def filter_single_company(
             logger.warning(
                 "filter_single_company.no_websites", company_id=company_id
             )
+            await update_status_task(pipeline_id, company_id, "excluded")
             await update_flow_status_task(pipeline_id, company_id, "X2")
             return FilterResult(
                 answer="YES",
@@ -327,6 +328,7 @@ async def filter_single_company(
             logger.warning(
                 "filter_single_company.no_website_id", company_id=company_id
             )
+            await update_status_task(pipeline_id, company_id, "excluded")
             await update_flow_status_task(pipeline_id, company_id, "X2")
             return FilterResult(
                 answer="YES",
@@ -345,6 +347,7 @@ async def filter_single_company(
                 company_id=company_id,
                 website_id=str(website_id),
             )
+            await update_status_task(pipeline_id, company_id, "excluded")
             await update_flow_status_task(pipeline_id, company_id, "X2")
             return FilterResult(
                 answer="YES",
@@ -369,6 +372,7 @@ async def filter_single_company(
             error=str(e),
         )
         try:
+            await update_status_task(pipeline_id, company_id, "excluded")
             await update_flow_status_task(pipeline_id, company_id, "X2")
         except Exception:
             pass
