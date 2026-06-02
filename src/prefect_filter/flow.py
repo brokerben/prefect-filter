@@ -206,8 +206,10 @@ async def fetch_pipeline_task(pipeline_id: str) -> dict[str, Any]:
 
 
 @task(name="fetch_companies")
-async def fetch_companies_task(pipeline_id: str) -> list[dict[str, Any]]:
-    companies = await client.fetch_companies(pipeline_id)
+async def fetch_companies_task(
+    pipeline_id: str, flow_status: str | None = None
+) -> list[dict[str, Any]]:
+    companies = await client.fetch_companies(pipeline_id, flow_status=flow_status)
     logger.info("fetch_companies.done", pipeline_id=pipeline_id, count=len(companies))
     return companies
 
@@ -506,13 +508,10 @@ async def filter_pipeline(
     """
     setup_logging()
 
-    companies = await fetch_companies_task(pipeline_id)
+    companies = await fetch_companies_task(pipeline_id, flow_status=flow_status)
     if not companies:
         logger.info("filter_pipeline.no_companies", pipeline_id=pipeline_id)
         return
-
-    if flow_status is not None:
-        companies = [c for c in companies if c.get("flowStatus") == flow_status]
 
     company_ids = [str(c["id"]) for c in companies]
 

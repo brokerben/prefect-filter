@@ -28,14 +28,19 @@ async def fetch_pipeline(pipeline_id: str) -> dict[str, Any]:
         return resp.json()
 
 
-async def fetch_companies(pipeline_id: str) -> list[dict[str, Any]]:
+async def fetch_companies(
+    pipeline_id: str, flow_status: str | None = None
+) -> list[dict[str, Any]]:
     all_companies: list[dict[str, Any]] = []
     page = 1
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         while True:
+            params: dict[str, Any] = {"pipelineId": pipeline_id, "page": page}
+            if flow_status is not None:
+                params["flowStatus"] = flow_status
             resp = await client.get(
                 f"{settings.backend_base_uri}/companies",
-                params={"pipelineId": pipeline_id, "page": page},
+                params=params,
                 headers=_headers(),
             )
             resp.raise_for_status()
