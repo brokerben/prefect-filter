@@ -1,6 +1,6 @@
 [project]
 name = "prefect-filter"
-version = "0.4.0"
+version = "0.2.0"
 description = "Prefect flow to filter pipeline companies against investment criteria using LLM evaluation"
 requires-python = ">=3.12"
 dependencies = [
@@ -9,7 +9,7 @@ dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "python-json-logger>=3.0.0",
-    "equimatch-agent",
+    "equimatch-agent==0.4.0",
 ]
 
 [dependency-groups]
@@ -37,4 +37,4 @@ pythonpath = ["src"]
 asyncio_mode = "auto"
 
 [tool.uv.sources]
-equimatch-agent = { git = "https://github.com/brokerben/harness.git", tag = "v0.4.0" }
+equimatch-agent = { git = "https://github.com/brokerben/harness.git" }
