@@ -16,13 +16,13 @@ logger = logging.getLogger(__name__)
 
 @runtime_checkable
 class EventBackend(Protocol):
-    def capture(self, distinct_id: str, event: str, properties: dict[str, Any]) -> None: ...
+    def capture(self, event: str, data: dict[str, Any]) -> None: ...
     def flush(self) -> None: ...
     def shutdown(self) -> None: ...
 
 
 class NullBackend:
-    def capture(self, distinct_id: str, event: str, properties: dict[str, Any]) -> None:
+    def capture(self, event: str, data: dict[str, Any]) -> None:
         pass
 
     def flush(self) -> None:
@@ -68,10 +68,10 @@ def _get_backend() -> EventBackend:
     return _backend
 
 
-def capture(distinct_id: str, event: str, properties: dict[str, Any] | None = None) -> None:
+def capture(event: str, data: dict[str, Any] | None = None) -> None:
     try:
-        props = {**(properties or {}), **_prefect_run_ids()}
-        _get_backend().capture(distinct_id, event, props)
+        enriched = {**(data or {}), **_prefect_run_ids()}
+        _get_backend().capture(event, enriched)
     except Exception:
         logger.warning("events.capture.failed", exc_info=True)
 

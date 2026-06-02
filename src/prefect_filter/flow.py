@@ -288,17 +288,14 @@ async def _apply_filter_decision(
             reason="answer_no",
             confidence=result.confidence.value,
         )
-        events.capture(
-            distinct_id=company_id,
-            event="company-excluded-from-pipeline",
-            properties={
-                "pipeline_id": pipeline_id,
-                "reasoning": result.outreach_message,
-                "confidence": result.confidence.value,
-                "type": "company",
-                "explanation": result.reasoning,
-            },
-        )
+        events.capture("company-excluded-from-pipeline", {
+            "id": company_id,
+            "pipeline_id": pipeline_id,
+            "reasoning": result.outreach_message,
+            "confidence": result.confidence.value,
+            "type": "company",
+            "explanation": result.reasoning,
+        })
         await update_status_task(pipeline_id, company_id, "excluded")
         await update_flow_status_task(pipeline_id, company_id, "Z2")
         return
@@ -309,18 +306,15 @@ async def _apply_filter_decision(
             company_id=company_id,
             confidence=result.confidence.value,
         )
-        events.capture(
-            distinct_id=company_id,
-            event="company-excluded-from-pipeline",
-            properties={
-                "pipeline_id": pipeline_id,
-                "reasoning": result.outreach_message,
-                "confidence": result.confidence.value,
-                "type": "company",
-                "reason": "confidence-low-included",
-                "explanation": result.reasoning,
-            },
-        )
+        events.capture("company-excluded-from-pipeline", {
+            "id": company_id,
+            "pipeline_id": pipeline_id,
+            "reasoning": result.outreach_message,
+            "confidence": result.confidence.value,
+            "type": "company",
+            "reason": "confidence-low-included",
+            "explanation": result.reasoning,
+        })
         await update_flow_status_task(pipeline_id, company_id, "Z2")
         await update_status_task(pipeline_id, company_id, "excluded")
         return
@@ -330,17 +324,14 @@ async def _apply_filter_decision(
         company_id=company_id,
         confidence=result.confidence.value,
     )
-    events.capture(
-        distinct_id=company_id,
-        event="company-fit-message",
-        properties={
-            "message": result.outreach_message,
-            "pipeline_id": pipeline_id,
-            "confidence": result.confidence.value,
-            "type": "company",
-            "reasoning": result.reasoning,
-        },
-    )
+    events.capture("company-fit-message", {
+        "id": company_id,
+        "message": result.outreach_message,
+        "pipeline_id": pipeline_id,
+        "confidence": result.confidence.value,
+        "type": "company",
+        "reasoning": result.reasoning,
+    })
     await update_status_task(
         pipeline_id, company_id, "active", clause=result.outreach_message
     )
@@ -415,11 +406,11 @@ async def filter_single_company(
                 company_id=company_id,
                 website_id=str(website_id),
             )
-            events.capture(
-                distinct_id=str(website_id),
-                event="website-description-empty",
-                properties={"company_id": company_id, "type": "website"},
-            )
+            events.capture("website-description-empty", {
+                "id": str(website_id),
+                "company_id": company_id,
+                "type": "website",
+            })
             await update_status_task(pipeline_id, company_id, "excluded")
             await update_flow_status_task(pipeline_id, company_id, "X2")
             result = FilterResult(
@@ -547,14 +538,11 @@ async def filter_pipeline(
     """
     setup_logging()
 
-    events.capture(
-        distinct_id=pipeline_id,
-        event="filter-pipeline-search-criteria-webhook",
-        properties={
-            "parameters": json.dumps({"pipeline_id": pipeline_id, "flow_status": flow_status}),
-            "type": "pipeline",
-        },
-    )
+    events.capture("filter-pipeline-search-criteria-webhook", {
+        "id": pipeline_id,
+        "parameters": json.dumps({"pipeline_id": pipeline_id, "flow_status": flow_status}),
+        "type": "pipeline",
+    })
 
     companies = await fetch_companies_task(pipeline_id, flow_status=flow_status)
     if not companies:
