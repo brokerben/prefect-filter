@@ -1,0 +1,27 @@
+interactions:
+- request:
+    body: '{"pipelineId": "pipeline123", "companyId": "company456", "status": "active",
+      "clause": "Your B2B SaaS expertise aligns with our client''s investment criteria."}'
+    headers:
+      Accept:
+      - '*/*'
+      Accept-Encoding:
+      - gzip, deflate, br
+      Connection:
+      - keep-alive
+      Content-Type:
+      - application/json
+      User-Agent:
+      - python-httpx/0.27.0
+    method: PATCH
+    uri: https://api.equimatch.example/companies/pipeline/status
+  response:
+    body:
+      string: '{}'
+    headers:
+      content-type:
+      - application/json; charset=utf-8
+    status:
+      code: 200
+      message: OK
+version: 1
