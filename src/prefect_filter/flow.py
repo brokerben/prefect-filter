@@ -12,7 +12,7 @@ from prefect import flow, task
 from prefect.artifacts import create_markdown_artifact, create_table_artifact
 from prefect.tasks import task_input_hash
 
-from prefect_filter import client
+from prefect_filter import client, posthog
 from prefect_filter.config import settings
 from prefect_filter.log import get_logger, setup_logging
 from prefect_filter.models import Confidence, FilterResult
@@ -288,6 +288,17 @@ async def _apply_filter_decision(
             reason="answer_no",
             confidence=result.confidence.value,
         )
+        posthog.capture(
+            distinct_id=company_id,
+            event="company-excluded-from-pipeline",
+            properties={
+                "pipeline_id": pipeline_id,
+                "reasoning": result.outreach_message,
+                "confidence": result.confidence.value,
+                "type": "company",
+                "explanation": result.reasoning,
+            },
+        )
         await update_status_task(pipeline_id, company_id, "excluded")
         await update_flow_status_task(pipeline_id, company_id, "Z2")
         return
@@ -298,6 +309,18 @@ async def _apply_filter_decision(
             company_id=company_id,
             confidence=result.confidence.value,
         )
+        posthog.capture(
+            distinct_id=company_id,
+            event="company-excluded-from-pipeline",
+            properties={
+                "pipeline_id": pipeline_id,
+                "reasoning": result.outreach_message,
+                "confidence": result.confidence.value,
+                "type": "company",
+                "reason": "confidence-low-included",
+                "explanation": result.reasoning,
+            },
+        )
         await update_flow_status_task(pipeline_id, company_id, "Z2")
         await update_status_task(pipeline_id, company_id, "excluded")
         return
@@ -306,6 +329,17 @@ async def _apply_filter_decision(
         "filter_decision.active",
         company_id=company_id,
         confidence=result.confidence.value,
+    )
+    posthog.capture(
+        distinct_id=company_id,
+        event="company-fit-message",
+        properties={
+            "message": result.outreach_message,
+            "pipeline_id": pipeline_id,
+            "confidence": result.confidence.value,
+            "type": "company",
+            "reasoning": result.reasoning,
+        },
     )
     await update_status_task(
         pipeline_id, company_id, "active", clause=result.outreach_message
@@ -380,6 +414,11 @@ async def filter_single_company(
                 "filter_single_company.empty_description",
                 company_id=company_id,
                 website_id=str(website_id),
+            )
+            posthog.capture(
+                distinct_id=str(website_id),
+                event="website-description-empty",
+                properties={"company_id": company_id, "type": "website"},
             )
             await update_status_task(pipeline_id, company_id, "excluded")
             await update_flow_status_task(pipeline_id, company_id, "X2")
@@ -508,6 +547,15 @@ async def filter_pipeline(
     """
     setup_logging()
 
+    posthog.capture(
+        distinct_id=pipeline_id,
+        event="filter-pipeline-search-criteria-webhook",
+        properties={
+            "parameters": json.dumps({"pipeline_id": pipeline_id, "flow_status": flow_status}),
+            "type": "pipeline",
+        },
+    )
+
     companies = await fetch_companies_task(pipeline_id, flow_status=flow_status)
     if not companies:
         logger.info("filter_pipeline.no_companies", pipeline_id=pipeline_id)
@@ -568,4 +616,5 @@ async def filter_pipeline(
     except Exception:
         logger.warning("create_pipeline_artifact.failed", pipeline_id=pipeline_id)
 
+    posthog.flush()
     logger.info("filter_pipeline.done", pipeline_id=pipeline_id)

@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     PHOENIX_COLLECTOR_ENDPOINT: str = ""
     phoenix_api_key: str = ""
 
+    # --- PostHog ---
+    posthog_api_key: str = ""
+    posthog_host: str = "https://us.i.posthog.com"
+
     # --- Concurrency ---
     max_concurrency: int = 5
 
