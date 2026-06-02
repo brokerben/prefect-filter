@@ -1,6 +1,6 @@
 [project]
 name = "prefect-filter"
-version = "0.1.0"
+version = "0.4.0"
 description = "Prefect flow to filter pipeline companies against investment criteria using LLM evaluation"
 requires-python = ">=3.12"
 dependencies = [
@@ -37,4 +37,4 @@ pythonpath = ["src"]
 asyncio_mode = "auto"
 
 [tool.uv.sources]
-equimatch-agent = { git = "https://github.com/brokerben/harness.git" }
+equimatch-agent = { git = "https://github.com/brokerben/harness.git", tag = "v0.4.0" }
