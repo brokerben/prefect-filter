@@ -9,6 +9,7 @@ from datetime import timedelta
 from typing import Any
 
 from prefect import flow, task
+from prefect.artifacts import create_markdown_artifact, create_table_artifact
 from prefect.tasks import task_input_hash
 
 from prefect_filter import client
@@ -125,6 +126,33 @@ def _parse_filter_result(raw: str, company_id: str) -> FilterResult:
         outreach_message=str(data.get("outreach_message", "")),
         reasoning=str(data.get("reasoning", "")),
     )
+
+
+async def _create_result_artifact(result: FilterResult) -> None:
+    decision = (
+        "Included (active)"
+        if result.answer == "YES" and result.confidence != Confidence.LOW
+        else "Excluded"
+    )
+    markdown = (
+        f"## Filter Result: {result.company_id}\n\n"
+        f"| Field | Value |\n|-------|-------|\n"
+        f"| Answer | {result.answer} |\n"
+        f"| Confidence | {result.confidence.value} |\n"
+        f"| Decision | {decision} |\n\n"
+        f"### Outreach Message\n{result.outreach_message or 'N/A'}\n\n"
+        f"### Reasoning\n{result.reasoning}\n"
+    )
+    try:
+        await create_markdown_artifact(
+            key=f"filter-result-{result.company_id}",
+            markdown=markdown,
+            description=f"Filter result for company {result.company_id}",
+        )
+    except Exception:
+        logger.warning(
+            "create_result_artifact.failed", company_id=result.company_id
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -315,13 +343,15 @@ async def filter_single_company(
             )
             await update_status_task(pipeline_id, company_id, "excluded")
             await update_flow_status_task(pipeline_id, company_id, "X2")
-            return FilterResult(
+            result = FilterResult(
                 answer="YES",
                 confidence=Confidence.LOW,
                 company_id=company_id,
                 outreach_message="",
                 reasoning="No website found for company; defaulting to YES.",
             )
+            await _create_result_artifact(result)
+            return result
 
         website_id = websites[0].get("websiteId") or websites[0].get("id")
         if not website_id:
@@ -330,13 +360,15 @@ async def filter_single_company(
             )
             await update_status_task(pipeline_id, company_id, "excluded")
             await update_flow_status_task(pipeline_id, company_id, "X2")
-            return FilterResult(
+            result = FilterResult(
                 answer="YES",
                 confidence=Confidence.LOW,
                 company_id=company_id,
                 outreach_message="",
                 reasoning="No website ID found for company; defaulting to YES.",
             )
+            await _create_result_artifact(result)
+            return result
 
         website_data = await fetch_website_task(str(website_id))
         description = website_data.get("website", {}).get("description") or ""
@@ -349,13 +381,15 @@ async def filter_single_company(
             )
             await update_status_task(pipeline_id, company_id, "excluded")
             await update_flow_status_task(pipeline_id, company_id, "X2")
-            return FilterResult(
+            result = FilterResult(
                 answer="YES",
                 confidence=Confidence.LOW,
                 company_id=company_id,
                 outreach_message="",
                 reasoning="Website description is empty; defaulting to YES.",
             )
+            await _create_result_artifact(result)
+            return result
 
         result = await evaluate_company_task(
             description=description,
@@ -363,6 +397,7 @@ async def filter_single_company(
             company_id=company_id,
         )
         await _apply_filter_decision(result, pipeline_id)
+        await _create_result_artifact(result)
         return result
 
     except Exception as e:
@@ -376,19 +411,21 @@ async def filter_single_company(
             await update_flow_status_task(pipeline_id, company_id, "X2")
         except Exception:
             pass
-        return FilterResult(
+        result = FilterResult(
             answer="YES",
             confidence=Confidence.LOW,
             company_id=company_id,
             outreach_message="",
             reasoning=f"Processing failed: {e}; defaulting to YES.",
         )
+        await _create_result_artifact(result)
+        return result
 
 
 @flow(name="filter_companies", log_prints=True)
 async def filter_companies(
     pipeline_id: str, company_ids: list[str]
-) -> None:
+) -> list[FilterResult]:
     """Filter specific companies against a pipeline's investment criteria.
 
     Invokes filter_single_company as a subflow for each company, with
@@ -420,12 +457,42 @@ async def filter_companies(
         return_exceptions=True,
     )
 
-    failed = sum(1 for r in results if isinstance(r, BaseException) or r is None)
+    valid_results = [r for r in results if isinstance(r, FilterResult)]
+    failed = len(company_ids) - len(valid_results)
     logger.info(
         "filter_companies.done",
         pipeline_id=pipeline_id,
-        processed=len(company_ids) - failed,
+        processed=len(valid_results),
     )
+
+    try:
+        table_data = [
+            {
+                "company_id": r.company_id,
+                "answer": r.answer,
+                "confidence": r.confidence.value,
+                "decision": (
+                    "active"
+                    if r.answer == "YES" and r.confidence != Confidence.LOW
+                    else "excluded"
+                ),
+                "reasoning": (
+                    r.reasoning[:120] + "..."
+                    if len(r.reasoning) > 120
+                    else r.reasoning
+                ),
+            }
+            for r in valid_results
+        ]
+        await create_table_artifact(
+            key=f"filter-batch-{pipeline_id}",
+            table=table_data,
+            description=f"Batch filter results for pipeline {pipeline_id}",
+        )
+    except Exception:
+        logger.warning("create_batch_artifact.failed", pipeline_id=pipeline_id)
+
+    return valid_results
 
 
 @flow(name="filter_pipeline", log_prints=True)
@@ -464,6 +531,42 @@ async def filter_pipeline(
         flow_status=flow_status,
     )
 
-    await filter_companies(pipeline_id, company_ids)
+    results = await filter_companies(pipeline_id, company_ids)
+
+    try:
+        accepted = sum(
+            1
+            for r in results
+            if r.answer == "YES" and r.confidence != Confidence.LOW
+        )
+        excluded = len(results) - accepted
+        failed = len(company_ids) - len(results)
+        high = sum(1 for r in results if r.confidence == Confidence.HIGH)
+        medium = sum(1 for r in results if r.confidence == Confidence.MEDIUM)
+        low = sum(1 for r in results if r.confidence == Confidence.LOW)
+
+        summary = (
+            f"## Pipeline Filter Summary\n\n"
+            f"**Pipeline ID:** {pipeline_id}\n\n"
+            f"**Flow Status Filter:** {flow_status or 'all'}\n\n"
+            f"**Total Companies:** {len(company_ids)}\n\n"
+            f"### Results\n\n"
+            f"| Metric | Count |\n|--------|-------|\n"
+            f"| Accepted (active) | {accepted} |\n"
+            f"| Excluded | {excluded} |\n"
+            f"| Failed | {failed} |\n\n"
+            f"### Confidence Distribution\n\n"
+            f"| Confidence | Count |\n|------------|-------|\n"
+            f"| High | {high} |\n"
+            f"| Medium | {medium} |\n"
+            f"| Low | {low} |\n"
+        )
+        await create_markdown_artifact(
+            key=f"filter-pipeline-{pipeline_id}",
+            markdown=summary,
+            description=f"Pipeline filter summary for {pipeline_id}",
+        )
+    except Exception:
+        logger.warning("create_pipeline_artifact.failed", pipeline_id=pipeline_id)
 
     logger.info("filter_pipeline.done", pipeline_id=pipeline_id)
