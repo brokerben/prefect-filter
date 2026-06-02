@@ -12,7 +12,7 @@ def main() -> None:
     pipeline_id = os.environ.get("PIPELINE_ID", "")
     if not pipeline_id:
         raise SystemExit("PIPELINE_ID environment variable is required")
-    flow_status = os.environ.get("FLOW_STATUS") or None
+    flow_status = os.environ.get("FLOW_STATUS") or "C2.2"
     asyncio.run(filter_pipeline(pipeline_id, flow_status=flow_status))
 
 
