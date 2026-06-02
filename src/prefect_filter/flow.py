@@ -497,7 +497,7 @@ async def filter_companies(
 
 @flow(name="filter_pipeline", log_prints=True)
 async def filter_pipeline(
-    pipeline_id: str, flow_status: str | None = None
+    pipeline_id: str, flow_status: str | None = "C2.2"
 ) -> None:
     """Filter all companies in a pipeline against its investment criteria.
 
