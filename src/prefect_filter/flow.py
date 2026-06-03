@@ -398,10 +398,7 @@ async def filter_single_company(
             return result
 
         website_data = await fetch_website_task(str(website_id))
-        description = website_data.get("website", {}).get("description") or ""
-
-        if not description:
-            description = company.get("description") or ""
+        description = website_data.get("website", {}).get("description") or company.get("description","")
 
         if not description:
             logger.info(
