@@ -21,7 +21,7 @@ def serve() -> None:
         name="pipeline-filter",
         tags=["filter", "pipeline"],
         description="Filter pipeline companies against investment criteria",
-        limit=RUN_LIMIT,
+        concurrency_limit=RUN_LIMIT,
     )
     filter_company = filter_single_company.to_deployment(
         name="filter-company",
