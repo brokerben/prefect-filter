@@ -401,6 +401,9 @@ async def filter_single_company(
         description = website_data.get("website", {}).get("description") or ""
 
         if not description:
+            description = company.get("description") or ""
+
+        if not description:
             logger.info(
                 "filter_single_company.empty_description",
                 company_id=company_id,
