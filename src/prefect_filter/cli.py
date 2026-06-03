@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from prefect import serve as prefect_serve
 
 from prefect_filter.flow import filter_companies, filter_pipeline, filter_single_company
 
@@ -28,4 +29,4 @@ def serve() -> None:
         tags=["filter", "single-company"],
         description="Filter company against investment criteria",
     )
-    serve(pipeline_filter, filter_company)
+    prefect_serve(pipeline_filter, filter_company)
