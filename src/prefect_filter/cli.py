@@ -17,9 +17,15 @@ def main() -> None:
 
 
 def serve() -> None:
-    filter_pipeline.serve(
+    pipeline_filter = filter_pipeline.to_deployment(
         name="pipeline-filter",
-        tags=["filter"],
+        tags=["filter", "pipeline"],
         description="Filter pipeline companies against investment criteria",
         limit=RUN_LIMIT,
     )
+    filter_company = filter_single_company.to_deployment(
+        name="filter-company",
+        tags=["filter", "single-company"],
+        description="Filter company against investment criteria",
+    )
+    serve(pipeline_filter, filter_company)
