@@ -10,7 +10,8 @@ from typing import Any
 
 from prefect import flow, task
 from prefect.artifacts import create_markdown_artifact, create_table_artifact
-from prefect.tasks import task_input_hash
+from prefect.concurrency.asyncio import concurrency
+from prefect.tasks import exponential_backoff, task_input_hash
 
 from prefect_filter import client, events
 from prefect_filter.config import settings
@@ -168,7 +169,13 @@ async def _create_result_artifact(result: FilterResult) -> None:
 # ---------------------------------------------------------------------------
 
 
-@task(name="evaluate_company", task_run_name="evaluate_company {company_id}")
+@task(
+    name="evaluate_company",
+    task_run_name="evaluate_company {company_id}",
+    retries=2,
+    retry_delay_seconds=exponential_backoff(backoff_factor=2),
+    timeout_seconds=120,
+)
 async def evaluate_company_task(
     description: str, criteria: str, company_id: str
 ) -> FilterResult:
@@ -207,6 +214,8 @@ async def evaluate_company_task(
     name="fetch_pipeline",
     cache_key_fn=task_input_hash,
     cache_expiration=timedelta(minutes=5),
+    retries=2,
+    retry_delay_seconds=5,
 )
 async def fetch_pipeline_task(pipeline_id: str) -> dict[str, Any]:
     data = await client.fetch_pipeline(pipeline_id)
@@ -214,7 +223,11 @@ async def fetch_pipeline_task(pipeline_id: str) -> dict[str, Any]:
     return data
 
 
-@task(name="fetch_companies")
+@task(
+    name="fetch_companies",
+    retries=3,
+    retry_delay_seconds=exponential_backoff(backoff_factor=2),
+)
 async def fetch_companies_task(
     pipeline_id: str, flow_status: str | None = None
 ) -> list[dict[str, Any]]:
@@ -223,7 +236,12 @@ async def fetch_companies_task(
     return companies
 
 
-@task(name="fetch_company", task_run_name="fetch_company {company_id}")
+@task(
+    name="fetch_company",
+    task_run_name="fetch_company {company_id}",
+    retries=3,
+    retry_delay_seconds=exponential_backoff(backoff_factor=2),
+)
 async def fetch_company_task(company_id: str) -> dict[str, Any]:
     data = await client.fetch_company(company_id)
     logger.info("fetch_company.done", company_id=company_id)
@@ -284,7 +302,8 @@ async def update_flow_status_task(
 # ---------------------------------------------------------------------------
 
 
-async def _apply_filter_decision(
+@task(name="apply_filter_decision", task_run_name="apply_filter_decision {result.company_id}")
+async def apply_filter_decision_task(
     result: FilterResult,
     pipeline_id: str,
 ) -> None:
@@ -305,8 +324,10 @@ async def _apply_filter_decision(
             "type": "company",
             "explanation": result.reasoning,
         })
-        await update_status_task(pipeline_id, company_id, "excluded")
-        await update_flow_status_task(pipeline_id, company_id, "Z2")
+        await asyncio.gather(
+            update_status_task(pipeline_id, company_id, "excluded"),
+            update_flow_status_task(pipeline_id, company_id, "Z2"),
+        )
         return
 
     if result.confidence == Confidence.LOW:
@@ -324,8 +345,10 @@ async def _apply_filter_decision(
             "reason": "confidence-low-included",
             "explanation": result.reasoning,
         })
-        await update_flow_status_task(pipeline_id, company_id, "Z2")
-        await update_status_task(pipeline_id, company_id, "excluded")
+        await asyncio.gather(
+            update_status_task(pipeline_id, company_id, "excluded"),
+            update_flow_status_task(pipeline_id, company_id, "Z2"),
+        )
         return
 
     logger.info(
@@ -341,10 +364,10 @@ async def _apply_filter_decision(
         "type": "company",
         "reasoning": result.reasoning,
     })
-    await update_status_task(
-        pipeline_id, company_id, "active", clause=result.outreach_message
+    await asyncio.gather(
+        update_status_task(pipeline_id, company_id, "active", clause=result.outreach_message),
+        update_flow_status_task(pipeline_id, company_id, "C3.1"),
     )
-    await update_flow_status_task(pipeline_id, company_id, "C3.1")
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +385,7 @@ async def filter_single_company(
     company, and updates pipeline status/flow_status accordingly.
     """
     setup_logging()
+    logger.info("filter_single_company.start", pipeline_id=pipeline_id, company_id=company_id)
 
     pipeline_data = await fetch_pipeline_task(pipeline_id)
     search_criteria = pipeline_data["pipeline"]["searchCriteria"]
@@ -408,6 +432,7 @@ async def filter_single_company(
             await _create_result_artifact(result)
             return result
 
+        logger.info("filter_single_company.fetching_website", company_id=company_id, website_id=str(website_id))
         website_data = await fetch_website_task(str(website_id))
         description = website_data.get("website", {}).get("description") or company.get("description","")
 
@@ -435,12 +460,13 @@ async def filter_single_company(
             await _create_result_artifact(result)
             return result
 
+        logger.info("filter_single_company.evaluating", company_id=company_id)
         result = await evaluate_company_task(
             description=description,
             criteria=search_criteria,
             company_id=company_id,
         )
-        await _apply_filter_decision(result, pipeline_id)
+        await apply_filter_decision_task(result, pipeline_id)
         await _create_result_artifact(result)
         return result
 
@@ -467,26 +493,22 @@ async def filter_single_company(
         return result
 
 
-@flow(name="filter_companies", log_prints=True)
-async def filter_companies(
+async def _filter_companies(
     pipeline_id: str, company_ids: list[str]
 ) -> list[FilterResult]:
-    """Filter specific companies against a pipeline's investment criteria.
+    """Filter companies against a pipeline's investment criteria.
 
     Invokes filter_single_company as a subflow for each company, with
-    concurrency limited by settings.max_concurrency.
+    concurrency controlled by the Prefect 'filter-company' concurrency limit.
     """
-    setup_logging()
-
     logger.info(
         "filter_companies.start",
         pipeline_id=pipeline_id,
         count=len(company_ids),
     )
-    semaphore = asyncio.Semaphore(settings.max_concurrency)
 
     async def _run(cid: str) -> FilterResult | None:
-        async with semaphore:
+        async with concurrency("filter-company", occupy=1):
             try:
                 return await filter_single_company(pipeline_id, cid)
             except Exception as e:
@@ -508,6 +530,7 @@ async def filter_companies(
         "filter_companies.done",
         pipeline_id=pipeline_id,
         processed=len(valid_results),
+        failed=failed,
     )
 
     try:
@@ -533,12 +556,16 @@ async def filter_companies(
         await create_table_artifact(
             key=f"filter-batch-{pipeline_id}",
             table=table_data,
-            description=f"Batch filter results for pipeline {pipeline_id}",
+            description=f"Batch filter results for pipeline {pipeline_id} — processed: {len(valid_results)}, failed: {failed}",
         )
     except Exception:
         logger.warning("create_batch_artifact.failed", pipeline_id=pipeline_id)
 
     return valid_results
+
+
+# Keep the public name available for direct invocation
+filter_companies = _filter_companies
 
 
 @flow(name="filter_pipeline", log_prints=True)
@@ -580,7 +607,7 @@ async def filter_pipeline(
         flow_status=flow_status,
     )
 
-    results = await filter_companies(pipeline_id, company_ids)
+    results = await _filter_companies(pipeline_id, company_ids)
 
     try:
         accepted = sum(

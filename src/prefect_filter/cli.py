@@ -2,9 +2,12 @@
 
 import asyncio
 import os
-from prefect import serve as prefect_serve
 
-from prefect_filter.flow import filter_companies, filter_pipeline, filter_single_company
+from prefect import serve as prefect_serve
+from prefect.concurrency.sync import create_concurrency_limit
+
+from prefect_filter.config import settings
+from prefect_filter.flow import filter_pipeline, filter_single_company
 
 RUN_LIMIT = int(os.environ.get("RUN_LIMIT", 5))
 
@@ -18,6 +21,13 @@ def main() -> None:
 
 
 def serve() -> None:
+    # Ensure the Prefect-native concurrency limit exists so the UI reflects it.
+    # This is idempotent — safe to call on every start.
+    create_concurrency_limit(
+        tag="filter-company",
+        concurrency_limit=settings.max_concurrency,
+    )
+
     pipeline_filter = filter_pipeline.to_deployment(
         name="pipeline-filter",
         tags=["filter", "pipeline"],
