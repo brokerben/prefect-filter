@@ -23,6 +23,7 @@ class Settings(BaseSettings):
 
     # --- Concurrency ---
     max_concurrency: int = 5
+    chunk_size: int = 50
 
 
 settings = Settings()

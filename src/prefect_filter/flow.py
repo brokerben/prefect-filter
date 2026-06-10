@@ -493,17 +493,27 @@ async def filter_single_company(
         return result
 
 
-async def _filter_companies(
-    pipeline_id: str, company_ids: list[str]
+@flow(
+    name="filter_companies",
+    flow_run_name="filter_companies chunk {chunk_index} ({len_companies} companies)",
+    log_prints=True,
+)
+async def filter_companies(
+    pipeline_id: str,
+    company_ids: list[str],
+    chunk_index: int = 0,
+    len_companies: int = 0,
 ) -> list[FilterResult]:
-    """Filter companies against a pipeline's investment criteria.
+    """Filter a chunk of companies against a pipeline's investment criteria.
 
     Invokes filter_single_company as a subflow for each company, with
     concurrency controlled by the Prefect 'filter-company' concurrency limit.
     """
+    setup_logging()
     logger.info(
         "filter_companies.start",
         pipeline_id=pipeline_id,
+        chunk_index=chunk_index,
         count=len(company_ids),
     )
 
@@ -564,10 +574,6 @@ async def _filter_companies(
     return valid_results
 
 
-# Keep the public name available for direct invocation
-filter_companies = _filter_companies
-
-
 @flow(name="filter_pipeline", log_prints=True)
 async def filter_pipeline(
     pipeline_id: str, flow_status: str | None = "C2.2"
@@ -600,14 +606,26 @@ async def filter_pipeline(
         )
         return
 
+    chunk_size = settings.chunk_size
+    chunks = [company_ids[i:i + chunk_size] for i in range(0, len(company_ids), chunk_size)]
     logger.info(
         "filter_pipeline.start",
         pipeline_id=pipeline_id,
         count=len(company_ids),
+        chunks=len(chunks),
+        chunk_size=chunk_size,
         flow_status=flow_status,
     )
 
-    results = await _filter_companies(pipeline_id, company_ids)
+    results: list[FilterResult] = []
+    for i, chunk in enumerate(chunks):
+        chunk_results = await filter_companies(
+            pipeline_id,
+            chunk,
+            chunk_index=i,
+            len_companies=len(chunk),
+        )
+        results.extend(chunk_results)
 
     try:
         accepted = sum(
