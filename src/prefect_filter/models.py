@@ -19,3 +19,4 @@ class FilterResult(BaseModel):
     company_id: str
     outreach_message: str
     reasoning: str
+    failure_reason: str | None = None  # None means no failure; set when process couldn't complete normally

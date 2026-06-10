@@ -97,6 +97,7 @@ def _parse_filter_result(raw: str, company_id: str) -> FilterResult:
             company_id=company_id,
             outreach_message="",
             reasoning="Failed to parse LLM output; defaulting to YES.",
+            failure_reason="parse_error: no JSON object found in LLM output",
         )
     try:
         data = json.loads(match.group(0))
@@ -107,6 +108,7 @@ def _parse_filter_result(raw: str, company_id: str) -> FilterResult:
             company_id=company_id,
             outreach_message="",
             reasoning="Failed to parse LLM JSON output; defaulting to YES.",
+            failure_reason="parse_error: invalid JSON in LLM output",
         )
 
     answer = str(data.get("answer", "YES")).upper()
@@ -134,12 +136,18 @@ async def _create_result_artifact(result: FilterResult) -> None:
         if result.answer == "YES" and result.confidence != Confidence.LOW
         else "Excluded"
     )
+    failure_row = (
+        f"| Process Failure | {result.failure_reason} |\n"
+        if result.failure_reason
+        else ""
+    )
     markdown = (
         f"## Filter Result: {result.company_id}\n\n"
         f"| Field | Value |\n|-------|-------|\n"
         f"| Answer | {result.answer} |\n"
         f"| Confidence | {result.confidence.value} |\n"
-        f"| Decision | {decision} |\n\n"
+        f"| Decision | {decision} |\n"
+        f"{failure_row}\n"
         f"### Outreach Message\n{result.outreach_message or 'N/A'}\n\n"
         f"### Reasoning\n{result.reasoning}\n"
     )
@@ -182,6 +190,7 @@ async def evaluate_company_task(
             company_id=company_id,
             outreach_message="",
             reasoning=f"LLM call failed: {e}; defaulting to YES.",
+            failure_reason=f"llm_error: {e}",
         )
 
     parsed = _parse_filter_result(raw, company_id)
@@ -343,7 +352,7 @@ async def _apply_filter_decision(
 # ---------------------------------------------------------------------------
 
 
-@flow(name="filter_single_company", log_prints=True)
+@flow(name="filter_single_company", flow_run_name="filter company {company_id}", log_prints=True)
 async def filter_single_company(
     pipeline_id: str, company_id: str
 ) -> FilterResult:
@@ -376,6 +385,7 @@ async def filter_single_company(
                 company_id=company_id,
                 outreach_message="",
                 reasoning="No website found for company; defaulting to YES.",
+                failure_reason="data_missing: company has no websites",
             )
             await _create_result_artifact(result)
             return result
@@ -393,6 +403,7 @@ async def filter_single_company(
                 company_id=company_id,
                 outreach_message="",
                 reasoning="No website ID found for company; defaulting to YES.",
+                failure_reason="data_missing: website entry has no ID",
             )
             await _create_result_artifact(result)
             return result
@@ -419,6 +430,7 @@ async def filter_single_company(
                 company_id=company_id,
                 outreach_message="",
                 reasoning="Website description is empty; defaulting to YES.",
+                failure_reason="data_missing: website description is empty",
             )
             await _create_result_artifact(result)
             return result
@@ -449,6 +461,7 @@ async def filter_single_company(
             company_id=company_id,
             outreach_message="",
             reasoning=f"Processing failed: {e}; defaulting to YES.",
+            failure_reason=f"processing_error: {e}",
         )
         await _create_result_artifact(result)
         return result
@@ -508,6 +521,7 @@ async def filter_companies(
                     if r.answer == "YES" and r.confidence != Confidence.LOW
                     else "excluded"
                 ),
+                "failure_reason": r.failure_reason or "",
                 "reasoning": (
                     r.reasoning[:120] + "..."
                     if len(r.reasoning) > 120
@@ -580,6 +594,22 @@ async def filter_pipeline(
         medium = sum(1 for r in results if r.confidence == Confidence.MEDIUM)
         low = sum(1 for r in results if r.confidence == Confidence.LOW)
 
+        # Collect companies that had a process failure
+        failed_companies = [r for r in results if r.failure_reason]
+        failed_rows = "".join(
+            f"| {r.company_id} | {r.failure_reason} |\n"
+            for r in failed_companies
+        )
+        process_failures_section = (
+            f"### Process Failures ({len(failed_companies)})\n\n"
+            + (
+                f"| Company ID | Failure Reason |\n|------------|----------------|\n{failed_rows}"
+                if failed_companies
+                else "_No process failures._\n"
+            )
+            + "\n"
+        )
+
         summary = (
             f"## Pipeline Filter Summary\n\n"
             f"**Pipeline ID:** {pipeline_id}\n\n"
@@ -589,12 +619,13 @@ async def filter_pipeline(
             f"| Metric | Count |\n|--------|-------|\n"
             f"| Accepted (active) | {accepted} |\n"
             f"| Excluded | {excluded} |\n"
-            f"| Failed | {failed} |\n\n"
+            f"| Failed (no result) | {failed} |\n\n"
             f"### Confidence Distribution\n\n"
             f"| Confidence | Count |\n|------------|-------|\n"
             f"| High | {high} |\n"
             f"| Medium | {medium} |\n"
-            f"| Low | {low} |\n"
+            f"| Low | {low} |\n\n"
+            f"{process_failures_section}"
         )
         await create_markdown_artifact(
             key=f"filter-pipeline-{pipeline_id}",
