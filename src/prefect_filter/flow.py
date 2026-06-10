@@ -352,7 +352,7 @@ async def _apply_filter_decision(
 # ---------------------------------------------------------------------------
 
 
-@flow(name="filter_single_company", log_prints=True)
+@flow(name="filter_single_company", flow_run_name="filter company {company_id}", log_prints=True)
 async def filter_single_company(
     pipeline_id: str, company_id: str
 ) -> FilterResult:
