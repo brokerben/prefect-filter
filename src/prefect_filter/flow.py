@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
 from prefect import flow, task
 from prefect.artifacts import create_markdown_artifact, create_table_artifact
-from prefect.concurrency.asyncio import concurrency
+from prefect.deployments import run_deployment
 from prefect.tasks import exponential_backoff, task_input_hash
 
 from prefect_filter import client, events
@@ -21,6 +23,24 @@ from prefect_filter.models import Confidence, FilterResult
 logger = get_logger(__name__)
 
 _MODEL_OVERRIDE = "google/gemma-4-31b-it"
+
+# Deployment slug (flow name / deployment name) used to launch each company as an
+# independent, individually-retryable flow run. Must match cli.py:serve().
+_FILTER_COMPANY_DEPLOYMENT = "filter_single_company/filter-company"
+
+
+@dataclass
+class ChunkOutcome:
+    """Outcome of filtering a chunk of companies.
+
+    ``results`` holds the FilterResult of every company that completed (whether
+    accepted or excluded). ``failures`` holds ``(company_id, error)`` for every
+    company whose run failed — these are NOT defaulted to included; they remain
+    Failed runs that are auto-retried and retryable from the Prefect UI.
+    """
+
+    results: list[FilterResult] = field(default_factory=list)
+    failures: list[tuple[str, str]] = field(default_factory=list)
 
 
 def _build_evaluation_prompt(
@@ -92,25 +112,15 @@ def _build_evaluation_prompt(
 def _parse_filter_result(raw: str, company_id: str) -> FilterResult:
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
-        return FilterResult(
-            answer="YES",
-            confidence=Confidence.LOW,
-            company_id=company_id,
-            outreach_message="",
-            reasoning="Failed to parse LLM output; defaulting to YES.",
-            failure_reason="parse_error: no JSON object found in LLM output",
+        raise ValueError(
+            f"parse_error: no JSON object found in LLM output for company {company_id}"
         )
     try:
         data = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return FilterResult(
-            answer="YES",
-            confidence=Confidence.LOW,
-            company_id=company_id,
-            outreach_message="",
-            reasoning="Failed to parse LLM JSON output; defaulting to YES.",
-            failure_reason="parse_error: invalid JSON in LLM output",
-        )
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"parse_error: invalid JSON in LLM output for company {company_id}"
+        ) from e
 
     answer = str(data.get("answer", "YES")).upper()
     if answer not in ("YES", "NO"):
@@ -191,14 +201,7 @@ async def evaluate_company_task(
         logger.warning(
             "evaluate_company.llm_failed", company_id=company_id, error=str(e)
         )
-        return FilterResult(
-            answer="YES",
-            confidence=Confidence.LOW,
-            company_id=company_id,
-            outreach_message="",
-            reasoning=f"LLM call failed: {e}; defaulting to YES.",
-            failure_reason=f"llm_error: {e}",
-        )
+        raise
 
     parsed = _parse_filter_result(raw, company_id)
     logger.info(
@@ -375,7 +378,13 @@ async def apply_filter_decision_task(
 # ---------------------------------------------------------------------------
 
 
-@flow(name="filter_single_company", flow_run_name="filter company {company_id}", log_prints=True)
+@flow(
+    name="filter_single_company",
+    flow_run_name="filter company {company_id}",
+    log_prints=True,
+    retries=2,
+    retry_delay_seconds=30,
+)
 async def filter_single_company(
     pipeline_id: str, company_id: str
 ) -> FilterResult:
@@ -390,107 +399,55 @@ async def filter_single_company(
     pipeline_data = await fetch_pipeline_task(pipeline_id)
     search_criteria = pipeline_data["pipeline"]["searchCriteria"]
 
-    try:
-        await update_status_task(pipeline_id, company_id, "processing")
+    await update_status_task(pipeline_id, company_id, "processing")
 
-        company_data = await fetch_company_task(company_id)
-        company = company_data.get("company", {})
-        websites = company.get("websites") or []
+    company_data = await fetch_company_task(company_id)
+    company = company_data.get("company", {})
+    websites = company.get("websites") or []
 
-        if not websites:
-            logger.warning(
-                "filter_single_company.no_websites", company_id=company_id
-            )
-            await update_status_task(pipeline_id, company_id, "excluded")
-            await update_flow_status_task(pipeline_id, company_id, "X2")
-            result = FilterResult(
-                answer="YES",
-                confidence=Confidence.LOW,
-                company_id=company_id,
-                outreach_message="",
-                reasoning="No website found for company; defaulting to YES.",
-                failure_reason="data_missing: company has no websites",
-            )
-            await _create_result_artifact(result)
-            return result
-
-        website_id = websites[0].get("websiteId") or websites[0].get("id")
-        if not website_id:
-            logger.warning(
-                "filter_single_company.no_website_id", company_id=company_id
-            )
-            await update_status_task(pipeline_id, company_id, "excluded")
-            await update_flow_status_task(pipeline_id, company_id, "X2")
-            result = FilterResult(
-                answer="YES",
-                confidence=Confidence.LOW,
-                company_id=company_id,
-                outreach_message="",
-                reasoning="No website ID found for company; defaulting to YES.",
-                failure_reason="data_missing: website entry has no ID",
-            )
-            await _create_result_artifact(result)
-            return result
-
-        logger.info("filter_single_company.fetching_website", company_id=company_id, website_id=str(website_id))
-        website_data = await fetch_website_task(str(website_id))
-        description = website_data.get("website", {}).get("description") or company.get("description","")
-
-        if not description:
-            logger.info(
-                "filter_single_company.empty_description",
-                company_id=company_id,
-                website_id=str(website_id),
-            )
-            events.capture("website-description-empty", {
-                "id": str(website_id),
-                "company_id": company_id,
-                "type": "website",
-            })
-            await update_status_task(pipeline_id, company_id, "excluded")
-            await update_flow_status_task(pipeline_id, company_id, "X2")
-            result = FilterResult(
-                answer="YES",
-                confidence=Confidence.LOW,
-                company_id=company_id,
-                outreach_message="",
-                reasoning="Website description is empty; defaulting to YES.",
-                failure_reason="data_missing: website description is empty",
-            )
-            await _create_result_artifact(result)
-            return result
-
-        logger.info("filter_single_company.evaluating", company_id=company_id)
-        result = await evaluate_company_task(
-            description=description,
-            criteria=search_criteria,
-            company_id=company_id,
+    if not websites:
+        logger.warning(
+            "filter_single_company.no_websites", company_id=company_id
         )
-        await apply_filter_decision_task(result, pipeline_id)
-        await _create_result_artifact(result)
-        return result
+        raise ValueError(f"data_missing: company {company_id} has no websites")
 
-    except Exception as e:
-        logger.error(
-            "filter_single_company.failed",
-            company_id=company_id,
-            error=str(e),
+    website_id = websites[0].get("websiteId") or websites[0].get("id")
+    if not website_id:
+        logger.warning(
+            "filter_single_company.no_website_id", company_id=company_id
         )
-        try:
-            await update_status_task(pipeline_id, company_id, "excluded")
-            await update_flow_status_task(pipeline_id, company_id, "X2")
-        except Exception:
-            pass
-        result = FilterResult(
-            answer="YES",
-            confidence=Confidence.LOW,
-            company_id=company_id,
-            outreach_message="",
-            reasoning=f"Processing failed: {e}; defaulting to YES.",
-            failure_reason=f"processing_error: {e}",
+        raise ValueError(
+            f"data_missing: website entry for company {company_id} has no ID"
         )
-        await _create_result_artifact(result)
-        return result
+
+    logger.info("filter_single_company.fetching_website", company_id=company_id, website_id=str(website_id))
+    website_data = await fetch_website_task(str(website_id))
+    description = website_data.get("website", {}).get("description") or company.get("description","")
+
+    if not description:
+        logger.info(
+            "filter_single_company.empty_description",
+            company_id=company_id,
+            website_id=str(website_id),
+        )
+        events.capture("website-description-empty", {
+            "id": str(website_id),
+            "company_id": company_id,
+            "type": "website",
+        })
+        raise ValueError(
+            f"data_missing: website description is empty for company {company_id}"
+        )
+
+    logger.info("filter_single_company.evaluating", company_id=company_id)
+    result = await evaluate_company_task(
+        description=description,
+        criteria=search_criteria,
+        company_id=company_id,
+    )
+    await apply_filter_decision_task(result, pipeline_id)
+    await _create_result_artifact(result)
+    return result
 
 
 @flow(
@@ -503,11 +460,13 @@ async def filter_companies(
     company_ids: list[str],
     chunk_index: int = 0,
     len_companies: int = 0,
-) -> list[FilterResult]:
+) -> ChunkOutcome:
     """Filter a chunk of companies against a pipeline's investment criteria.
 
-    Invokes filter_single_company as a subflow for each company, with
-    concurrency controlled by the Prefect 'filter-company' concurrency limit.
+    Launches each company as an independent ``filter-company`` deployment run via
+    run_deployment, so a single company's failure is isolated (the rest of the
+    chunk continues) and that company's run is auto-retried and retryable from the
+    Prefect UI. Concurrency is gated by the deployment's own concurrency limit.
     """
     setup_logging()
     logger.info(
@@ -517,30 +476,53 @@ async def filter_companies(
         count=len(company_ids),
     )
 
-    async def _run(cid: str) -> FilterResult | None:
-        async with concurrency("filter-company", occupy=1):
-            try:
-                return await filter_single_company(pipeline_id, cid)
-            except Exception as e:
-                logger.error(
-                    "filter_companies.subflow_failed",
-                    company_id=cid,
-                    error=str(e),
-                )
-                return None
+    async def _run(cid: str) -> FilterResult | Exception:
+        flow_run = await run_deployment(
+            name=_FILTER_COMPANY_DEPLOYMENT,
+            parameters={"pipeline_id": pipeline_id, "company_id": cid},
+        )
+        state = flow_run.state
+        if state is None or not state.is_completed():
+            message = state.message if state is not None else "no state"
+            raise RuntimeError(
+                f"company {cid} run did not complete: "
+                f"{state.type if state is not None else 'UNKNOWN'} ({message})"
+            )
+        # Completed — recover the FilterResult for summary purposes. Status
+        # updates and artifacts already happened inside the company's own run, so
+        # failure to fetch the result here is non-fatal.
+        result = state.result(raise_on_failure=False)
+        if inspect.isawaitable(result):
+            result = await result
+        if not isinstance(result, FilterResult):
+            raise RuntimeError(
+                f"company {cid} run completed without a FilterResult"
+            )
+        return result
 
-    results = await asyncio.gather(
+    gathered = await asyncio.gather(
         *[_run(cid) for cid in company_ids],
         return_exceptions=True,
     )
 
-    valid_results = [r for r in results if isinstance(r, FilterResult)]
-    failed = len(company_ids) - len(valid_results)
+    outcome = ChunkOutcome()
+    for cid, item in zip(company_ids, gathered):
+        if isinstance(item, FilterResult):
+            outcome.results.append(item)
+        else:
+            error = str(item)
+            outcome.failures.append((cid, error))
+            logger.error(
+                "filter_companies.company_failed",
+                company_id=cid,
+                error=error,
+            )
+
     logger.info(
         "filter_companies.done",
         pipeline_id=pipeline_id,
-        processed=len(valid_results),
-        failed=failed,
+        processed=len(outcome.results),
+        failed=len(outcome.failures),
     )
 
     try:
@@ -554,24 +536,34 @@ async def filter_companies(
                     if r.answer == "YES" and r.confidence != Confidence.LOW
                     else "excluded"
                 ),
-                "failure_reason": r.failure_reason or "",
-                "reasoning": (
+                "status": "completed",
+                "detail": (
                     r.reasoning[:120] + "..."
                     if len(r.reasoning) > 120
                     else r.reasoning
                 ),
             }
-            for r in valid_results
+            for r in outcome.results
+        ] + [
+            {
+                "company_id": cid,
+                "answer": "",
+                "confidence": "",
+                "decision": "failed",
+                "status": "failed",
+                "detail": error[:120] + "..." if len(error) > 120 else error,
+            }
+            for cid, error in outcome.failures
         ]
         await create_table_artifact(
             key=f"filter-batch-{pipeline_id}",
             table=table_data,
-            description=f"Batch filter results for pipeline {pipeline_id} — processed: {len(valid_results)}, failed: {failed}",
+            description=f"Batch filter results for pipeline {pipeline_id} — processed: {len(outcome.results)}, failed: {len(outcome.failures)}",
         )
     except Exception:
         logger.warning("create_batch_artifact.failed", pipeline_id=pipeline_id)
 
-    return valid_results
+    return outcome
 
 
 @flow(name="filter_pipeline", log_prints=True)
@@ -618,14 +610,16 @@ async def filter_pipeline(
     )
 
     results: list[FilterResult] = []
+    failures: list[tuple[str, str]] = []
     for i, chunk in enumerate(chunks):
-        chunk_results = await filter_companies(
+        chunk_outcome = await filter_companies(
             pipeline_id,
             chunk,
             chunk_index=i,
             len_companies=len(chunk),
         )
-        results.extend(chunk_results)
+        results.extend(chunk_outcome.results)
+        failures.extend(chunk_outcome.failures)
 
     try:
         accepted = sum(
@@ -634,23 +628,22 @@ async def filter_pipeline(
             if r.answer == "YES" and r.confidence != Confidence.LOW
         )
         excluded = len(results) - accepted
-        failed = len(company_ids) - len(results)
+        failed = len(failures)
         high = sum(1 for r in results if r.confidence == Confidence.HIGH)
         medium = sum(1 for r in results if r.confidence == Confidence.MEDIUM)
         low = sum(1 for r in results if r.confidence == Confidence.LOW)
 
-        # Collect companies that had a process failure
-        failed_companies = [r for r in results if r.failure_reason]
+        # Companies whose run FAILED (external dependency failure). These are not
+        # defaulted to included/excluded — they remain Failed runs to be retried.
         failed_rows = "".join(
-            f"| {r.company_id} | {r.failure_reason} |\n"
-            for r in failed_companies
+            f"| {cid} | {error} |\n" for cid, error in failures
         )
         process_failures_section = (
-            f"### Process Failures ({len(failed_companies)})\n\n"
+            f"### Failed Runs ({len(failures)})\n\n"
             + (
                 f"| Company ID | Failure Reason |\n|------------|----------------|\n{failed_rows}"
-                if failed_companies
-                else "_No process failures._\n"
+                if failures
+                else "_No failed runs._\n"
             )
             + "\n"
         )
