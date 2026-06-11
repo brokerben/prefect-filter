@@ -12,6 +12,7 @@ from typing import Any
 
 from prefect import flow, task
 from prefect.artifacts import create_markdown_artifact, create_table_artifact
+from prefect.concurrency.asyncio import concurrency
 from prefect.deployments import run_deployment
 from prefect.tasks import exponential_backoff, task_input_hash
 
@@ -466,7 +467,8 @@ async def filter_companies(
     Launches each company as an independent ``filter-company`` deployment run via
     run_deployment, so a single company's failure is isolated (the rest of the
     chunk continues) and that company's run is auto-retried and retryable from the
-    Prefect UI. Concurrency is gated by the deployment's own concurrency limit.
+    Prefect UI. Concurrency is gated by the "filter-company" global concurrency
+    limit.
     """
     setup_logging()
     logger.info(
@@ -477,10 +479,14 @@ async def filter_companies(
     )
 
     async def _run(cid: str) -> FilterResult | Exception:
-        flow_run = await run_deployment(
-            name=_FILTER_COMPANY_DEPLOYMENT,
-            parameters={"pipeline_id": pipeline_id, "company_id": cid},
-        )
+        # Gate concurrent company processing via the "filter-company" global
+        # concurrency limit (created in cli.py:serve). The slot is held for the
+        # whole company run and released even if it fails.
+        async with concurrency("filter-company", occupy=1):
+            flow_run = await run_deployment(
+                name=_FILTER_COMPANY_DEPLOYMENT,
+                parameters={"pipeline_id": pipeline_id, "company_id": cid},
+            )
         state = flow_run.state
         if state is None or not state.is_completed():
             message = state.message if state is not None else "no state"
@@ -611,15 +617,18 @@ async def filter_pipeline(
 
     results: list[FilterResult] = []
     failures: list[tuple[str, str]] = []
-    for i, chunk in enumerate(chunks):
-        chunk_outcome = await filter_companies(
-            pipeline_id,
-            chunk,
-            chunk_index=i,
-            len_companies=len(chunk),
-        )
-        results.extend(chunk_outcome.results)
-        failures.extend(chunk_outcome.failures)
+    # Gate concurrent pipeline runs via the "filter-pipeline" global concurrency
+    # limit (created in cli.py:serve).
+    async with concurrency("filter-pipeline", occupy=1):
+        for i, chunk in enumerate(chunks):
+            chunk_outcome = await filter_companies(
+                pipeline_id,
+                chunk,
+                chunk_index=i,
+                len_companies=len(chunk),
+            )
+            results.extend(chunk_outcome.results)
+            failures.extend(chunk_outcome.failures)
 
     try:
         accepted = sum(

@@ -3,7 +3,7 @@
 import asyncio
 import os
 
-from prefect import serve as prefect_serve
+from prefect import get_client, serve as prefect_serve
 
 from prefect_filter.config import settings
 from prefect_filter.flow import filter_pipeline, filter_single_company
@@ -19,19 +19,32 @@ def main() -> None:
     asyncio.run(filter_pipeline(pipeline_id, flow_status=flow_status))
 
 
+async def _create_concurrency_limits() -> None:
+    # Create the named global concurrency limits enforced via concurrency(...) in
+    # flow.py and surfaced in the Prefect UI. Idempotent (upsert) — safe to call
+    # on every start.
+    async with get_client() as client:
+        # Caps how many companies are evaluated concurrently across all runs.
+        await client.upsert_global_concurrency_limit_by_name(
+            name="filter-company", limit=settings.max_concurrency
+        )
+        # Caps how many pipeline runs process concurrently.
+        await client.upsert_global_concurrency_limit_by_name(
+            name="filter-pipeline", limit=RUN_LIMIT
+        )
+
+
 def serve() -> None:
-    # Each company runs as its own filter-company deployment run; the deployment's
-    # concurrency_limit (set below) gates how many run at once.
+    asyncio.run(_create_concurrency_limits())
+
     pipeline_filter = filter_pipeline.to_deployment(
         name="pipeline-filter",
         tags=["filter", "pipeline"],
         description="Filter pipeline companies against investment criteria",
-        concurrency_limit=RUN_LIMIT,
     )
     filter_company = filter_single_company.to_deployment(
         name="filter-company",
         tags=["filter", "single-company"],
         description="Filter company against investment criteria",
-        concurrency_limit=settings.max_concurrency,
     )
     prefect_serve(pipeline_filter, filter_company)
